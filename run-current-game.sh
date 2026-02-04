@@ -1,12 +1,25 @@
 #!/bin/bash
 set -u
 
-shadps4="/media/kalaposfos/Shared/shadps4/repos/shadps4-dev/build/shadps4"
-ps4_mount="/mnt/ps4"
-ftpminidump="/media/kalaposfos/Shared/shadps4/tools/shadps4-from-ps4/ftpminidump"
-ftpminidump_root="/media/kalaposfos/Shared/goldhen/ftpdump"
-merged_mount="/media/kalaposfos/Shared/shadps4/etc/game_mount"
-ps4_ip="10.42.0.178:2121"
+ftpminidump="$(dirname $0)/ftpminidump"
+dotenv="$(dirname $0)/.env"
+[ -f "$dotenv" ] || { 
+    cat <<EOF > .env
+shadps4="" # the shadPS4 (CLI) executable
+ps4_mount="" # path to mount the PS4 FTP server to
+ftpminidump_root="" # path to dump game metadata to
+merged_mount="" # working directory for overlayfs
+ps4_ip="" # "ip:port" format
+EOF
+    echo "Please set your enviroment variables.";
+    exit 1;
+}
+. $dotenv
+
+: "${shadps4:?shadps4 not set}"
+: "${ps4_mount:?ps4_mount not set}"
+: "${merged_mount:?merged_mount not set}"
+: "${ps4_ip:?ps4_ip not set}"
 
 unmount_if_needed() {
     mount | grep -q "on $1 " && echo "Unmounting $1" && umount "$1"
@@ -26,7 +39,7 @@ command -v fuse-overlayfs >/dev/null || {
 [ -x "$shadps4" ] || { echo "shadPS4 not found"; exit 1; }
 [ -f "$ftpminidump" ] || { echo "ftpminidump not found"; exit 1; }
 [ -d "$ps4_mount/mnt/sandbox" ] || {
-    echo "PS4 mount not found or not mounted";
+    echo "PS4 mount not found or not mounted, attempting to mount...";
     command -v curlftpfs >/dev/null 2>&1 || {
         echo "curlftpfs not found in PATH"
         exit 1
