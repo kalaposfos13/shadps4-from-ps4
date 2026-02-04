@@ -1,0 +1,1798 @@
+#!/bin/bash
+# Dumps PS4 games via FTP connection over the network.
+# Requires cURL, GNU Wget, and a PS4 FTP server that supports SELF decryption.
+# Best results with the FTP payload from https://github.com/hippie68/ps4-ftp.
+# For maximum speed, a gigabit cable connection is recommended.
+# Get the latest script version at https://github.com/hippie68/ftpdump.
+# Please report bugs at https://github.com/hippie68/ftpdump/issues.
+
+# Optional default values: #####################################################
+
+# PS4's IP address
+ip=
+# PS4's FTP port (FTP payload: 1337)
+port=
+# Beep when done
+beep=false
+# How long to beep, in seconds
+beep_time=60
+# How frequently to beep, in seconds
+beep_interval=3
+# Path (directory or file) to C program "sfo" (https://github.com/hippie68/sfo)
+sfo_path=
+
+# Functions: ###################################################################
+
+print_usage() {
+  cat << EOF
+Usage: ${0##*/} [OPTIONS] HOSTNAME|IP_ADDRESS[:PORT]
+
+1) Insert a disc and install the game. Optional: visit orbispatches.com
+   to download and install a game patch compatible with your firmware.
+2) Start a PS4 FTP server (recommended: https://github.com/hippie68/ps4-ftp).
+3) Press the PS button to leave the browser.
+4) Run the game.
+5) Run this script.
+
+To dump more installed games, repeat steps 4) and 5).
+
+Before running the script, make sure the game is completely installed.
+Exit the script at any time by pressing CTRL-C.
+
+Options:
+  -a, --app            Dump app data.
+      --active         Use an active FTP connection instead of a passive one.
+      --appdb          Dump app.db file and quit.
+      --beep           Beep when done.
+  -d, --dlc            Dump DLC data.
+      --debug          Print debug information.
+      --debug-pfs      Print debug information when extracting a PFS image file.
+      --download PATH  Download specified FTP file or directory and quit.
+                       Directories must end with a slash: "PATH/".
+      --download TITLE_ID [TITLE_ID ...]
+                       Download PKG files having the specified Title ID(s) and
+                       quit. Can be combined with options --app, --patch, --dlc.
+      --extract-pfs PFS_IMAGE_FILE
+                       Extract a local PFS image file and quit.
+      --extract-pkg PKG_FILE
+                       Extract a local PS4 PKG file and quit.
+      --fix-remaster PARAM_SFO_FILE
+                       Apply the "remaster" fix to a local param.sfo file and
+                       quit. Requires program "sfo".
+  -h, --help           Print usage information.
+  -k, --keystone       Dump original keystone.
+      --keep-trying    Infinitely keep trying to connect.
+      --list[N]        Print a sorted list of installed PKGs and quit. Can be
+                       combined with options --app, --patch, --dlc. The optional
+                       number N specifies the sort order: 1: Title ID, 2: Type,
+                       3: Location, 4: Database status, 5: PKG status, 6: Title.
+      --no-decrypt     Do not use server-side SELF decryption.
+  -o, --output-dir DIRECTORY
+                       Set the root output directory for dumps and extractions.
+  -p, --patch          Dump patch data.
+  -r, --resume         Resume a previously interrupted download. When used with
+                       unpatched FTP servers, this can corrupt decrypted files.
+  -s, --sflash         Dump sflash0 file and quit.
+      --shutdown       Send the custom FTP command "SHUTDOWN" and quit. If the
+                       FTP server understands the command, it will stop running.
+      --use-pfs        While dumping, instead of downloading files separately,
+                       download and extract the PFS image file.
+  -v, --verbose        Print the client/server dialog when downloading files.
+EOF
+}
+
+debug_message() {
+  echo -e "\r\e[95mDEBUG: \e[35m$1\e[0m" >&2
+}
+
+warning_message() {
+  echo -e "\r\e[93mWARNING: $1\e[0m" >&2
+  ((warnings++))
+}
+
+critical_message() {
+  echo -e "\r\e[91mCRITICAL: $1\e[0m" >&2
+  ((criticals++))
+}
+
+# Parses command line arguments, creating C-like argc and argv; called with $@.
+build_args() {
+  argc=0
+  while [[ $1 && $1 != "--" ]]; do
+    if [[ $1 == --* ]]; then
+      argv[argc++]=$1
+    elif [[ $1 == -?* ]]; then
+      for ((i = 1; i < ${#1}; i++)); do
+        argv[argc++]=-${1:i:1}
+      done
+    else
+      argv[argc++]=$1
+    fi
+    shift
+  done
+  while [[ $1 ]]; do
+    argv[argc++]=$1
+    shift
+  done
+  [[ $debug ]] && debug_message "Expanded arguments: ${argv[*]}"
+}
+
+# Beeps to signal script completion.
+beep_function() {
+  # Only beep for larger tasks or when explicitly enabled
+  if [[ ($beep == true && $option_app$option_patch$option_dlc) || $force_beep ]]; then
+    trap exit SIGINT
+    printf "\n(Press CTRL-C to stop beeping.)\n"
+
+    if [[ ! $beep_time ]]; then
+      beep_time=60
+    fi
+    if [[ ! $beep_interval ]]; then
+      beep_interval=3
+    fi
+    local i=0
+    while [[ $i -le $beep_time ]]; do
+      echo -en "\a"
+      sleep $beep_interval
+      ((i += beep_interval))
+    done
+  fi
+}
+
+# Stops all downloads the FTP server might still be trying to send.
+# Requires the server to support the custom command KILL.
+kill_downloads() {
+  if [[ $kill_switch ]]; then
+    curl $curl_options --head --quote KILL "$root" 2> /dev/null
+  fi
+}
+
+# Properly stops all downloads, then exits the script.
+# $1: exit code, $2: optional message
+clean_exit() {
+  local exit_code=$1
+  kill $(jobs -p) 2> /dev/null
+  wait
+  kill_downloads
+
+  # Delete temporary error log file
+  if [[ -f "$error_file" ]]; then
+    if [[ -s "$error_file" ]]; then
+      [[ $exit_code -eq 0 ]] && exit_code=1
+      echo "Error log:"
+      cat "$error_file"
+    fi
+    rm "$error_file" 2> /dev/null || echo \
+      "Could not remove temporary file \"$error_file\". Please remove it manually." >&2
+  fi
+  if [[ $2 ]]; then
+    echo "$2"
+  fi
+
+  # Delete all remaining temporary files
+  local file
+  while read file; do
+    rm "$file" &> /dev/null
+  done < <(cat "$temp_file_list")
+  rm "$temp_file_list"
+
+  [[ $exit_code -eq 0 ]] && echo "Done."
+  [[ $warnings -gt 0 ]] && echo -e "\e[93m$warnings warning message(s).\e[0m"
+  [[ $criticals -gt 0 ]] && echo -e "\e[91m$criticals critical message(s)\e[0m."
+  beep_function
+  exit $exit_code
+}
+
+# Runs when user has pressed CTRL-C or sent SIGINT.
+sigint_exit() {
+  unset beep
+  unset force_beep
+  clean_exit 0 "Script aborted by user."
+}
+
+# Stops the script execution, printing an optional error message $1.
+# $2 being set means it's a critical bug that needs to be reported.
+abort() {
+  if [[ $1 ]]; then
+    echo "$1" >&2
+  fi
+
+  if [[ $2 ]]; then
+    critical_message "Please report this at https://github.com/hippie68/ftpdump/issues."
+  fi
+
+  # If this is the main process (not a job), then clean-exit with final message
+  if [[ $BASHPID == $main_pid ]]; then
+    clean_exit 1 "Error encountered, script aborted."
+  else # End the job
+    # Log the message in the error log file
+    [[ -f "$error_file" ]] && echo "[$(date)] $1" >> "$error_file"
+    exit 1
+  fi
+}
+
+# Used by the main process to check if errors occured during jobs.
+check_for_errors() {
+  if [[ -s "$error_file" ]]; then
+    abort
+  fi
+}
+
+# Called when cURL encounters an error; aborts the script.
+# $1: optional file name or description where the error occured
+curl_error() {
+  local message="cURL reported error $? (see https://curl.se/libcurl/c/libcurl-errors.html)."
+  if [[ $1 ]]; then
+    message="\"${1#$root}\": $message"
+  else
+    message="${0##*/}: $message"
+  fi
+  [[ $curl_verbose ]] && echo -e "\e[0m" # Reset verbose color
+  abort "$message"
+}
+
+# Called when Wget encounters an error.
+# $1: exit code
+wget_error() {
+  local e
+  case $1 in
+    0) e="No problems occured" ;;
+    1) e="Generic error code" ;;
+    2) e="Parse error" ;;
+    3) e="File I/O error" ;;
+    4) e="Network failure" ;;
+    5) e="SSL verification failure" ;;
+    6) e="Username/password authentication failure" ;;
+    7) e="Protocol error" ;;
+    8) e="Server issued an error response" ;;
+    *) e="Unknown error (see https://www.gnu.org/software/wget/manual/html_node/Exit-Status.html" ;;
+  esac
+  abort "Wget reported error $1: \"$e.\""
+}
+
+# Portable replacement for GNU realpath.
+realpath() {
+  echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+}
+
+# Prints an overall progress percentage in front of each download's file name
+# while dumping app/patch.
+print_download_progress() {
+  local result=$((downloaded_bytes * 100 / download_size))
+  if [[ $result -gt 100 ]]; then
+    result=100
+  fi
+  echo -en "$result% "
+}
+
+# $1: expected download size
+enable_download_progress() {
+  download_size=$1
+  downloaded_bytes=0
+  download_progress_enabled=1
+}
+
+disable_download_progress() {
+  echo -en "\e[2K\r"
+  unset download_progress_enabled
+}
+
+# Sets global variable $download_size to size of FTP file $1, in bytes.
+# $2: size unit: "kb" or "mb" (empty for bytes)
+set_download_size() {
+  download_size=$(curl $curl_options --silent --head "$1" \
+    | grep 'Content-Length')
+  if [[ $? -eq 0 ]]; then
+    download_size=${download_size#* }
+    download_size=${download_size%[^0-9]*}
+    case $2 in
+      kb) download_size=$((download_size / 1000)) ;;
+      mb) download_size=$((download_size / 1000000)) ;;
+    esac
+  else
+    download_size=0
+  fi
+}
+
+# Set SELF decryption, if the FTP server supports it.
+# $1: "0": disable decryption, "1": enable decryption
+set_decryption() {
+  if [[ $debug ]]; then
+    case $1 in
+      0) debug_message "Disabling server-side SELF decryption ..." >&2 ;;
+      1) debug_message "Enabling server-side SELF decryption ..." >&2 ;;
+    esac
+  fi
+
+  local response
+  response=$(curl -v --silent --quote DECRYPT "$root" 2>&1)
+  if [[ $response == *'SELF decryption enabled'* ]]; then
+    if [[ $1 == 0 ]]; then
+      response=$(curl -v --silent --quote DECRYPT "$root" 2>&1)
+      [[ $? != 0 ]] && curl_error
+      if [[ $response == *'SELF decryption disabled'* ]]; then
+        [[ $debug ]] && debug_message "SELF decryption disabled."
+      else
+        echo "Unexpected error: could not disable server-side SELF decryption." >&2
+        return 1
+      fi
+    else
+      [[ $debug ]] && debug_message "SELF decryption enabled."
+    fi
+  elif [[ $response == *'SELF decryption disabled'* ]]; then
+    if [[ $1 == 0 ]]; then
+      [[ $debug ]] && debug_message "SELF decryption disabled."
+    else
+      response=$(curl -v --silent --quote DECRYPT "$root" 2>&1)
+      [[ $? != 0 ]] && curl_error
+      if [[ $response == *'SELF decryption enabled'* ]]; then
+        [[ $debug ]] && debug_message "SELF decryption enabled."
+      else
+        echo "Unexpected error: could not enable server-side SELF decryption." >&2
+        return 1
+      fi
+    fi
+  elif [[ $goldhen_2_old ]]; then
+    if [[ $1 == 0 ]]; then
+      warning_message "This FTP server always decrypts and is not able to disable SELF decryption."
+      return 1
+    elif [[ $1 == 1 ]]; then
+      [[ $debug ]] && debug_message "This FTP server always decrypts."
+    fi
+  else
+    warning_message "This FTP server is not able to toggle SELF decryption. Consult your FTP server's documentation to find out whether it decrypts, or use a different FTP server."
+    return 1
+  fi
+
+  return 0
+}
+
+# Checks if an FTP file or directory exists.
+ftp_file_exists() {
+  if curl --head --silent "$1" &> /dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Prints all FTP subdirectories in FTP directory $1.
+print_ftp_subdirectories() {
+  local line
+  local dir
+
+  while read line; do
+    # Check for known directory listing syntax, while at the same time storing
+    # directory entry values in BASH_REMATCH[] array
+    if [[ ! $line =~ ^(.{10})\ ([0-9]+)\ ([^ ]+[ ]*[^ ]+)\ ([0-9]+)\ ([^ ]+\ +[0-9]+\ [^ ]+)\ (.+) ]]; then
+      abort "Not able to proceed: FTP server uses unknown directory listing." 1
+    fi
+
+    # Print directory name
+    if [[ $line == d* ]]; then
+      dir=${BASH_REMATCH[6]}
+      if [[ $dir != . && $dir != .. ]]; then
+        echo "$dir"
+      fi
+    fi
+  done < <(curl --silent "$1")
+}
+
+# Creates a temporary file and returns the file name.
+create_temp_file() {
+  local file_name
+  file_name=$(mktemp)
+  [[ $? -ne 0 ]] && abort "Could not create a temporary file."
+  echo "$file_name" >> "$temp_file_list"
+  printf "$file_name"
+}
+
+# Checks if keystone $1 is fake.
+check_keystone() {
+  local i
+  local string
+
+  for ((i = 32; i < 64; i++)); do
+    IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$i if="$1" 2>/dev/null)
+    string+=$(printf "%x" "'$byte")
+  done
+  if [[ $string == \
+    294a5ed06db170618f2eed8c424b9d828879c080cc66fbc4864f69e974deb856 ]]; then
+    warning_message "Keystone is not original."
+  fi
+}
+
+# Converts a remaster param.sfo file into a regular param.sfo.
+# $1: param.sfo file name
+fix_remaster() {
+  local sfo_error=0
+
+  # Create a backup before changing the file
+  local backup_file=$(create_temp_file)
+  cp "$1" "$backup_file"
+
+  # Try to fix the file
+  local app_ver
+  app_ver=$("$sfo_path" "$1" -q app_ver) && "$sfo_path" "$1" -d REMASTER_TYPE \
+    -d TARGET_APP_VER -e app_ver "01.00" -e version "$app_ver" \
+    || {
+      # If errors occured, try to restore the backup
+      sfo_error=1
+      echo "Applying the remaster fix to \"$1\" has failed." >&2
+      if cp "$backup_file" "$1"; then
+        echo "Original file restored." >&2
+      else
+        abort "Furthermore, restoring the original file has failed. Apologies, the file is now damaged." 1
+      fi
+    }
+
+  rm "$backup_file"
+
+  return $sfo_error
+}
+
+# Dumping: ---------------------------------------------------------------------
+
+# Downloads a single FTP file $1, overwriting existing files.
+# (optional: $2: bytes to skip, $3: bytes to download)
+dump_file() {
+  local new_file=${1##*/}
+
+  [[ $verbose ]] && echo -en "\e[2K\e[36m"
+
+  # Download partial file
+  if [[ $2 ]]; then
+    curl $curl_options $curl_verbose --silent --ignore-content-length \
+      "${1//#/%23}" | dd "$dd_options" skip="$2" count="$3" 2> /dev/null \
+      > "$new_file" || curl_error "$1"
+    kill_downloads
+    [[ $verbose ]] && echo -en "\e[0m"
+  # Download full file
+  else
+    wget --no-verbose $wget_options $wget_resume $wget_verbose \
+      "$1" --output-document "$new_file" 2>&1 | \
+      while read -r line; do
+        [[ $line && $line != *" -> "* ]] && echo "$line"
+      done
+
+    # Abort script if download has failed
+    local result=${PIPESTATUS[0]}
+    if [[ $result -gt 0 ]]; then
+      # Remove file if its size is 0
+      if [[ -f "$new_file" && ! -s "$new_file" ]]; then
+        [[ $debug ]] && debug_message \
+          "Download failed - removing empty file \"$new_file\"."
+        rm "$new_file" &> /dev/null
+      fi
+
+      [[ $verbose ]] && echo -en "\e[0m"
+      wget_error $result
+    fi
+
+    echo -e "\e[2K\r\e[0m$new_file"
+  fi
+}
+
+# Recursively downloads an FTP directory with GNU Wget.
+# $1: full directory path; must end with "/"
+dump_dir() {
+  local dir_count=0
+  local line
+  local i
+
+  # Count number of directories for Wget
+  line=${1#$root}
+  for ((i = 1; i < ${#line}; i++)); do
+    if [[ ${line:$i:1} == "/" ]]; then
+      ((dir_count++))
+    fi
+  done
+  [[ $debug ]] && debug_message \
+    "Dumping directory \"$line\", cutting $dir_count directories."
+
+  # Download directory recursively
+  wget --cut-dirs $dir_count --no-host-directories --no-parent \
+    --no-verbose --recursive $wget_options $wget_resume $wget_verbose \
+    --accept-regex='(/$|(^|/)(eboot[^/]*|[^/]*\.(elf|prx|sprx))$)' \
+    --level inf "$1" 2>&1 | \
+    while read -r line; do
+      if [[ $line == *" ->"* ]]; then
+        file_name=${line%\"*}
+        file_name=${file_name#*] -> \"}
+        file_name=${file_name%.listing} # Wget's temporary files
+        file_size=${line%] -> \"*}
+        file_size=${file_size##*[}
+        if [[ $file_name ]]; then
+          echo -e "\e[2K\r$file_name"
+          # Update download progress
+          if [[ $download_progress_enabled ]]; then
+            ((downloaded_bytes += file_size))
+            print_download_progress
+          fi
+        fi
+      elif [[ $verbose && $line != "" ]]; then
+        echo -e "\e[36m$line\e[0m"
+      fi
+    done
+  find . -type d -empty -delete
+
+  # Abort script if download has failed
+  local result=${PIPESTATUS[0]}
+  if [[ $result -gt 0 ]]; then
+    wget_error $result
+  fi
+}
+
+# Dumps the keystone that belongs to Title ID $1.
+dump_keystone() {
+  cd "$output_dir" || abort
+  echo "Dumping $title_id keystone:"
+  mkdir -p "$1-keystone" && cd "$1-keystone" || abort
+  dump_file "$root/mnt/sandbox/pfsmnt/$1-app0/sce_sys/keystone"
+  check_keystone keystone
+}
+
+# Checks for and replaces encrypted trophy files from within ./sce_sys/.
+replace_encrypted_trophies() {
+  local i=0
+  local magic_number
+  local trophy_dirs
+  local trophy_file
+
+  # Check previously downloaded npbind.dat for trophy directory names
+  readarray -t trophy_dirs < <(grep -aoE 'NPWR[0-9]{5}_[0-9]{2}' npbind.dat)
+  [[ $debug ]] && debug_message \
+    "Trophy directories found in npbind.dat: ${trophy_dirs[*]}"
+
+  for trophy_file in trophy/trophy[0-9][0-9].trp; do
+    # Quit if no trophy files exist
+    if [[ ! -f $trophy_file ]]; then
+      return
+    fi
+
+    echo "Checking trophy files for encryption ..."
+
+    read magic_number < <(dd if="$trophy_file" bs=1 count=3 2> /dev/null)
+    if [[ $magic_number == $(printf "\xdc\xa2\x4d") ]]; then
+      echo "File \"${trophy_file##*/}\" is not encrypted."
+    else
+      echo "File \"${trophy_file##*/}\" is encrypted."
+      if [[ ${trophy_dirs[$i]} ]]; then
+        echo "Replacing \"${trophy_file##*/}\" with unencrypted version ..."
+        [[ $debug ]] && debug_message \
+          "Copying from trophy directory \"${trophy_dirs[$i]}\""
+        dump_file "$root/user/trophy/conf/${trophy_dirs[$i]}/TROPHY.TRP" \
+          > /dev/null
+        mv TROPHY.TRP "$trophy_file" || abort
+      else
+        critical_message \
+          "Could not find unencrypted version of \"${trophy_file##*/}\"." >&2
+      fi
+    fi
+
+    ((i++))
+  done
+}
+
+# Replaces npbind.dat and nptitle.dat for Title ID $1 from within ./sce_sys/.
+replace_np_files() {
+  echo "Replacing npbind.dat and nptitle.dat ..."
+  rm -f npbind.dat nptitle.dat || abort \
+    "Could not delete npbind.dat and/or nptitle.dat."
+  if ftp_file_exists "$root/system_data/priv/appmeta/$1/npbind.dat"; then
+    dump_file "$root/system_data/priv/appmeta/$1/npbind.dat"
+  fi
+  if ftp_file_exists "$root/system_data/priv/appmeta/$1/nptitle.dat"; then
+    dump_file "$root/system_data/priv/appmeta/$1/nptitle.dat"
+  fi
+}
+
+# Dumps app data that belongs to Title ID $1.
+dump_app_data() {
+  set_download_size "$root/mnt/sandbox/pfsmnt/$1-app0-nest/pfs_image.dat"
+
+  cd "$output_dir" || abort
+  echo "Dumping $1 app data ($((download_size / 1000000)) MB):"
+  mkdir -p "$1" && cd "$1" || abort
+
+  if [[ $pfs_extraction_enabled ]]; then
+    dump_and_extract_pfs_image \
+      "$root/mnt/sandbox/pfsmnt/$1-app0-nest/pfs_image.dat"
+    replace_encrypted_files "$root/mnt/sandbox/pfsmnt/$1-app0/"
+  else
+    enable_download_progress "$download_size"
+    dump_dir "$root/mnt/sandbox/pfsmnt/$1-app0/"
+    disable_download_progress
+  fi
+
+  mkdir -p sce_sys && cd sce_sys || abort
+  if ftp_file_exists "$root/user/app/$1/app.pkg"; then
+    dump_and_extract_pkg "$root/user/app/$1/app.pkg"
+  elif ftp_file_exists "$root/mnt/ext0/user/app/$1/app.pkg"; then
+    dump_and_extract_pkg "$root/mnt/ext0/user/app/$1/app.pkg"
+  elif ftp_file_exists "$root/preinst2/app/$1/app.pkg"; then
+    dump_and_extract_pkg "$root/preinst2/app/$1/app.pkg"
+  else
+    abort "Could not find FTP file \"app.pkg\"."
+  fi
+
+  if [[ -f param.sfo ]] && grep -ao REMASTER_TYPE param.sfo &> /dev/null; then
+    if [[ $sfo_path ]]; then
+      warning_message "App is of type \"remaster\". Trying to fix it ..."
+      if fix_remaster param.sfo; then
+        echo "Remaster fix has been applied."
+      else
+        echo "Unable to apply remaster fix."
+      fi
+    else
+      warning_message \
+        "App is of type \"remaster\" - editing the file \"$output_dir/$1/sce_sys/param.sfo\" may be necessary (e.g. by using the experimental option --fix-remaster)."
+    fi
+  fi
+
+  replace_np_files "$1"
+  if [[ -f npbind.dat ]]; then
+    replace_encrypted_trophies
+  fi
+}
+
+# Dumps patch data that belongs to Title ID $1.
+dump_patch_data() {
+  [[ $debug ]] && debug_message "Checking if patch data exists."
+  curl $curl_options --silent --head \
+    "$root/mnt/sandbox/pfsmnt/$1-patch0/" > /dev/null
+  if [[ $? == 0 ]]; then
+    set_download_size \
+      "$root/mnt/sandbox/pfsmnt/$1-patch0-nest/pfs_image.dat"
+
+    cd "$output_dir" || abort
+    echo "Dumping $1 patch data ($((download_size / 1000000)) MB):"
+    mkdir -p "$1-patch" && cd "$1-patch" || abort
+
+    if [[ $pfs_extraction_enabled ]]; then
+      dump_and_extract_pfs_image \
+        "$root/mnt/sandbox/pfsmnt/$1-patch0-nest/pfs_image.dat"
+      replace_encrypted_files "$root/mnt/sandbox/pfsmnt/$1-patch0/"
+    else
+      enable_download_progress "$download_size"
+      dump_dir "$root/mnt/sandbox/pfsmnt/$1-patch0/"
+      disable_download_progress
+    fi
+
+    mkdir -p sce_sys && cd sce_sys || abort
+    if ftp_file_exists "$root/user/patch/$1/patch.pkg"; then
+      dump_and_extract_pkg "$root/user/patch/$1/patch.pkg"
+    elif ftp_file_exists "$root/mnt/ext0/user/patch/$1/patch.pkg"; then
+      dump_and_extract_pkg "$root/mnt/ext0/user/patch/$1/patch.pkg"
+    else
+      abort "Could not find FTP file \"patch.pkg\"."
+    fi
+
+    replace_np_files "$1"
+    if [[ -f npbind.dat ]]; then
+      replace_encrypted_trophies
+    fi
+  else
+    echo "No patch data found for $1."
+  fi
+}
+
+# Dumps DLC data that belongs to Title ID $1.
+dump_dlc_data() {
+  local dlc_dirs
+  local line
+
+  [[ $debug ]] && debug_message "Checking if DLC data exists."
+  while read line; do
+    if [[ $line == d*$1*-ac ]]; then
+      [[ $debug ]] && debug_message "Found DLC directory ${line##* }"
+      dlc_dirs+="${line##* } "
+    fi
+  done < <(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/")
+
+  if [[ $dlc_dirs ]]; then
+    cd "$output_dir" || abort
+    echo "Dumping $1 DLC data:"
+    mkdir -p "$1-dlc" && cd "$1-dlc" || abort
+    for dir in $dlc_dirs; do
+      mkdir "$dir" && cd "$dir" || abort
+      dump_dir "$root/mnt/sandbox/pfsmnt/$dir/"
+      cd .. || abort
+    done
+  else
+    echo "No DLC data found for $1."
+  fi
+}
+
+# Downloads all PKGs that have the Title ID(s) $@.
+dump_pkgs() {
+  local ftp_file
+  local title_id
+
+  for title_id in "$@"; do
+    if [[ $option_app ]]; then
+      for ftp_file in "$root/user/app/$title_id/app.pkg" \
+        "$root/mnt/ext0/user/app/$title_id/app.pkg"; do
+        if ftp_file_exists "$ftp_file"; then
+          cd "$output_dir" || abort
+          set_download_size "$ftp_file" mb
+          echo "Downloading $title_id app PKG ($download_size MB) ..."
+          mkdir -p "$title_id-app-pkg" && cd "$title_id-app-pkg" || abort
+          curl $curl_options $curl_resume $curl_verbose --progress-bar \
+            --remote-name "$ftp_file" || curl_error "$ftp_file"
+          ftp_file=
+          break;
+        fi
+      done
+      [[ $ftp_file ]] && echo "No app PKG found for $title_id."
+    fi
+
+    if [[ $option_patch ]]; then
+      for ftp_file in "$root/user/patch/$title_id/patch.pkg" \
+        "$root/mnt/ext0/user/patch/$title_id/patch.pkg"; do
+        if ftp_file_exists "$ftp_file"; then
+          cd "$output_dir" || abort
+          set_download_size "$ftp_file" mb
+          echo "Downloading $title_id patch PKG ($download_size MB) ..."
+          mkdir -p "$title_id-patch-pkg" && cd "$title_id-patch-pkg" || abort
+          curl $curl_options $curl_resume $curl_verbose --progress-bar \
+            --remote-name "$ftp_file" || curl_error "$ftp_file"
+          ftp_file=
+          break;
+        fi
+      done
+      [[ $ftp_file ]] && echo "No patch PKG found for $title_id."
+    fi
+
+    if [[ $option_dlc ]]; then
+      local dlc_dir
+
+      # Internal DLC
+      while read -r dlc_dir; do
+        ftp_file="$root/user/addcont/$title_id/$dlc_dir/ac.pkg"
+        if ftp_file_exists "$ftp_file"; then
+          cd "$output_dir" || abort
+          set_download_size "$ftp_file" mb
+          echo "Downloading $title_id DLC PKG \"$dlc_dir\" ($download_size MB) ..."
+          mkdir -p "$title_id-dlc-pkg" && cd "$title_id-dlc-pkg" || abort
+          mkdir -p "$dlc_dir" && cd "$dlc_dir" || abort
+          curl $curl_options $curl_resume $curl_verbose --progress-bar \
+            --remote-name "$ftp_file" || curl_error "$ftp_file"
+        else
+          echo "No DLC PKG found for DLC \"$dlc_dir\"."
+        fi
+      done < <(print_ftp_subdirectories "$root/user/addcont/$title_id/")
+
+      # External DLC
+      while read -r dlc_dir; do
+        ftp_file="$root/mnt/ext0/user/addcont/$title_id/$dlc_dir/ac.pkg"
+        if ftp_file_exists "$ftp_file"; then
+          cd "$output_dir" || abort
+          set_download_size "$ftp_file" mb
+          echo "Downloading $title_id DLC PKG \"$dlc_dir\" ($download_size MB) ..."
+          mkdir -p "$title_id-dlc-pkg" && cd "$title_id-dlc-pkg" || abort
+          mkdir -p "$dlc_dir" && cd "$dlc_dir" || abort
+          curl $curl_options $curl_resume $curl_verbose --progress-bar \
+            --remote-name "$ftp_file" || curl_error "$ftp_file"
+        else
+          echo "No DLC PKG found for DLC \"$dlc_dir\"."
+        fi
+      done < <(print_ftp_subdirectories "$root/mnt/ext0/user/addcont/$title_id/")
+
+      if [[ ! $dlc_dir ]]; then
+        echo "No DLC PKGs found for $title_id."
+      fi
+    fi
+  done
+}
+
+# PKG list: --------------------------------------------------------------------
+
+# Searches an FTP directory for subdirectories that resemble Title IDs, and
+# prints them, to be saved in an array.
+# $1: The FTP directory's full path with a trailing slash
+print_title_ids() {
+  local line
+  while read line; do
+    if [[ $line =~ ^[A-Z]{4}[0-9]{5}$ ]]; then
+      printf "$line "
+    fi
+  done < <(print_ftp_subdirectories "$1")
+}
+
+# Part of populate_pkg_list(); appends a new line to the temporary PKG list.
+# $1: an FTP path pointing to a Title ID directory
+# Variables known from list_pkgs(): $pkg_list
+pkg_list_append() {
+  local line
+  local title_id
+  local type
+  local external
+
+  if [[ $1 == */mnt/ext0/* ]]; then
+    external=1
+  fi
+
+  # Add Title ID to line
+  title_id=${1%/}
+  title_id=${title_id##*/}
+  line+="$title_id   "
+
+  # Add type to line
+  case $1 in
+    */app/*)     type=app;     line+='App     ' ;;
+    */patch/*)   type=patch;   line+='Patch   ' ;;
+    */addcont/*) type=addcont; line+='DLC     ' ;;
+  esac
+
+  # Add location to line
+  if [[ $external ]]; then
+    line+='external   '
+  else
+    line+='internal   '
+  fi
+
+  # Add database status to line
+  if grep "$title_id" "$temp_database_file" > /dev/null; then
+    line+='OK   '
+  else
+    line+='-    '
+  fi
+
+  # Add PKG status to line
+  case $type in
+    app)
+      if ftp_file_exists "$1app.pkg"; then
+        line+='OK   '
+      else
+        line+='-    '
+      fi
+      ;;
+    patch)
+      if ftp_file_exists "$1patch.pkg"; then
+        line+='OK   '
+      else
+        line+='-    '
+      fi
+      ;;
+    addcont)
+      local dir
+      local ac_count=0
+      local ac_count_total=0
+      while read dir; do
+        ((ac_count_total++))
+        if ftp_file_exists "$1$dir/ac.pkg"; then
+          ((ac_count++))
+        fi
+      done < <(print_ftp_subdirectories "$1")
+      if [[ ac_count_total -eq 0 ]]; then
+        line+='-    '
+      else
+        local temp_line="$ac_count/$ac_count_total"
+        while [[ ${#temp_line} -lt 5 ]]; do
+          temp_line+=' '
+        done
+        line+="$temp_line"
+      fi
+      ;;
+  esac
+
+  # Add PKG's title to line, if program sfo is available
+  if [[ $sfo_path ]]; then
+    local temp_param_file=$(create_temp_file)
+    curl $curl_options --silent "$root/system_data/priv/appmeta/$title_id/param.sfo" \
+      > "$temp_param_file"
+    if [[ $? -eq 0 ]]; then
+      # Add title
+      line+="$("$sfo_path" -q title "$temp_param_file")"
+      [[ $? -ne 0 ]] && abort
+
+      # Add version
+      local version
+      if [[ $type == app ]]; then
+        local patch_file="/user/patch/$title_id/patch.pkg"
+        [[ $external ]] && patch_file="/mnt/ext0$patch_file"
+        if ftp_file_exists "$root$patch_file"; then
+          version='01.00' # Guessed, for speed reasons; may be wrong if a
+                          # regular patch was installed over a self-merged PKG
+        else
+          local changeinfo_file="/user/appmeta/$title_id/changeinfo/changeinfo.xml"
+          [[ $external ]] && changeinfo_file="/mnt/ext0$changeinfo_file"
+          if ftp_file_exists "$root$changeinfo_file"; then
+            changeinfo_file=$(curl $curl_options --silent "$root$changeinfo_file")
+            [[ $? -ne 0 ]] && abort
+            version=$(printf '%s' "$changeinfo_file" \
+              | grep -Po '(?<=<changes app_ver=")[0-9]{2}\.[0-9]{2}' \
+              | sort -r | head -n 1)
+          else
+            version="$("$sfo_path" -q app_ver "$temp_param_file")"
+            [[ $? -ne 0 ]] && abort
+          fi
+        fi
+      elif [[ $type == patch ]]; then
+        version="$("$sfo_path" -q app_ver "$temp_param_file")"
+        [[ $? -ne 0 ]] && abort
+      fi
+      [[ $version ]] && line+=" [v${version#0}]"
+
+      rm "$temp_param_file" || abort \
+        "Could not delete the temporary file \"$temp_param_file\"."
+    else
+      line+="[App not installed]"
+    fi
+  fi
+
+  # Write the line into the temporary PKG list file
+  printf "$line\n" >> "$pkg_list"
+}
+
+# Adds installed PKGs of a specific type to the temporary PKG list file while
+# printing progress.
+# $1: type ("app", "patch", "addcont")
+populate_pkg_list() {
+  local title_id
+  local path
+  local paths=()
+  local type
+
+  case $1 in
+    app) type=app ;;
+    patch) type=patch ;;
+    addcont) type=DLC ;;
+  esac
+
+  for title_id in $(print_title_ids "$root/user/$1/"); do
+    paths+=("$root/user/$1/$title_id/")
+  done
+  for title_id in $(print_title_ids "$root/mnt/ext0/user/$1/"); do
+    paths+=("$root/mnt/ext0/user/$1/$title_id/")
+  done
+
+  # Print PKG list
+  local title_id_count=0
+  local title_id_count_total=${#paths[*]}
+
+  for path in "${paths[@]}"; do
+    ((title_id_count++))
+    printf "\e[2K\r$title_id_count/$title_id_count_total $type Title IDs" >&2
+    if [[ $(jobs -r | wc -l) -ge 50 ]]; then
+      wait -n
+    fi
+
+    # Don't use jobs if the FTP server is from an older GoldHEN version
+    # (it could crash quickly)
+    if [[ $goldhen_2_old ]]; then
+      pkg_list_append "$path" # Seems even without jobs it likes to crash soon?
+    else
+      pkg_list_append "$path" &
+    fi
+  done
+}
+
+# Lists installed PKGs.
+# $1: sort order ("1": Title ID, "2": Location "3": Type, "4": Database status,
+# "5": PKG status, "6": Title)
+list_pkgs() {
+  local pkg_list=$(create_temp_file)
+
+  # Save app DB
+  local temp_database_file=$(create_temp_file)
+  curl $curl_options --silent "$root/system_data/priv/mms/app.db" > "$temp_database_file" \
+    || curl_error
+
+  [[ $option_app ]] && populate_pkg_list "app"
+  [[ $option_patch ]] && populate_pkg_list "patch"
+  [[ $option_dlc ]] && populate_pkg_list "addcont"
+
+  wait
+  if [[ $sfo_path ]]; then
+    printf "\e[2K\rTitle ID    Type    Location   DB   PKG  Title\n"
+  else
+    printf "\e[2K\rTitle ID    Type    Location   DB   PKG\n"
+  fi
+  cat "$pkg_list" | sort --ignore-case --ignore-leading-blanks --key=$1
+  rm "$temp_database_file"
+  rm "$pkg_list"
+}
+
+# PKG extraction: --------------------------------------------------------------
+
+# Returns a 4-byte integer, read from a file in big-endian.
+# $1: the return variable's name
+# $2: file name
+# $3: integer's offset
+read_int_be() {
+  local _result=0
+  local byte
+  local i
+
+  for i in {0..3}; do
+    IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$(($3 + i)) if="$2" \
+      2> /dev/null)
+    byte=$(printf "%d" "'$byte")
+    _result=$((_result + 256 ** (3 - i) * byte))
+  done
+
+  eval "$1=\$_result"
+}
+
+# Returns a string, read from a file as a C string (ending with \0).
+# $1: the return variable's name
+# $2: file name
+# $3: string's offset
+read_string() {
+  local _result
+  local byte
+  local i=0
+
+  while true; do
+    IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$(($3 + i)) if="$2" \
+      2> /dev/null)
+    if [[ $(printf "%d" "'$byte") != 0 ]]; then
+      _result+=$byte
+    else
+      break
+    fi
+    ((i++))
+  done
+
+  eval "$1=\$_result"
+}
+
+# Extracts a single file from a PKG file.
+# $1: PKG file name
+# $2: offset
+# $3: size
+# $4: output file name
+extract_pkg_file() {
+  echo "Extracting $4"
+  if [[ $4 == */* ]]; then # Create directory, if necessary
+    mkdir -p "${4%/*}"
+  fi
+  dd if="$1" "$dd_options" skip="$2" count="$3" 2> /dev/null > "$4" || abort \
+    "Could not extract file \"$4\"."
+}
+
+# Extracts all files from PKG file $1.
+extract_pkg() {
+  local file_table_offset
+  read_int_be file_table_offset "$1" $((0x18))
+  local file_count
+  read_int_be file_count "$1" $((0x10))
+  local offset=$file_table_offset
+  local id
+  local filename_offset
+  local data_offset
+  local size
+  local filename
+  local unknown_count
+
+  # Loop through all entries
+  local i=0
+  while [[ $i -lt $file_count ]]; do
+    read_int_be id "$1" offset
+    read_int_be filename_offset "$1" $((offset + 4))
+    read_int_be data_offset "$1" $((offset + 16))
+    read_int_be size "$1" $((offset + 20))
+    if [[ $id == 512 ]]; then
+      filename_table_offset=$data_offset
+    fi
+
+    if [[ $debug ]]; then
+      debug_message "$(printf "ID: %#x\n" $id)"
+      debug_message "File name offset: $filename_offset"
+      debug_message "Data offset: $data_offset"
+      debug_message "Size: $size"
+    fi
+
+    # Extract entries that are files
+    if [[ $id -ge 1024 ]]; then
+      # For files that have no name, create file name
+      if [[ $id -lt 4096 ]]; then
+        case $id in
+          1024) filename=license.dat ;; # 0x400
+          1025) filename=license.info ;;
+          1026) filename=nptitle.dat ;;
+          1027) filename=npbind.dat ;;
+          1028) filename=selfinfo.dat ;;
+          1030) filename=imageinfo.dat ;;
+          1031) filename=target-deltainfo.dat ;;
+          1032) filename=origin-deltainfo.dat ;;
+          1033) filename=psreserved.dat ;;
+             *) filename=UNKNOWN_$((unknown_count++))
+                printf "WARNING: No file name known for file ID \"%#x\".\n" $id >&2
+                printf "         Using file name \"%s\".\n" "$filename" >&2
+                ;;
+        esac
+      # For other files, read existing file names
+      elif [[ $filename_table_offset && $filename_offset -gt 0 ]]; then
+        read_string filename "$1" $((filename_table_offset + filename_offset))
+      fi
+      [[ $debug ]] && debug_message "File name: \"$filename\""
+      # Extract file
+      if [[ $resume || ! -e "$filename" ]]; then
+        extract_pkg_file "$1" $data_offset $size "$filename"
+      else
+        warning_message "File already exists: \"$filename\" (skipped)."
+      fi
+    fi
+
+    ((i++))
+    ((offset += 32))
+  done
+}
+
+# Dumps and extracts the body files of PKG file $1.
+dump_and_extract_pkg() {
+  local pkg_filename=${1##*/}
+
+  echo "Preparing extraction of $pkg_filename ..."
+
+  # Test how much PKG data should be downloaded
+  [[ $debug ]] && debug_message \
+    "Dumping 48 bytes from $pkg_filename to get body size."
+  dump_file "$1" 0 48
+  local body_offset
+  read_int_be body_offset "$pkg_filename" 36
+  [[ $debug ]] && debug_message "Body offset: $body_offset"
+  local body_size
+  read_int_be body_size "$pkg_filename" 44
+  [[ $debug ]] && debug_message "Body size: $body_size"
+
+  # Download PKG body and extract PKG files
+  [[ $debug ]] && debug_message \
+    "Dumping body from $pkg_filename ($((body_offset + body_size)) bytes)."
+  dump_file "$1" 0 $((body_offset + body_size))
+  [[ $debug ]] && debug_message "Extracting ..."
+  extract_pkg "$pkg_filename"
+
+  rm "$pkg_filename" || abort \
+    "Could not remove temporary file \"$pkg_filename\"."
+}
+
+# PFS extraction: --------------------------------------------------------------
+
+readonly INODE_SIZE=168
+declare -a inode_offsets
+declare superroot_inode_index
+declare block_size
+
+# Returns an integer, read from a file in little-endian.
+# $1: the return variable's name
+# $2: file name
+# $3: integer's offset
+# $4: integer's data length in bytes
+read_int_le() {
+  local _result=0
+  local byte
+  local i
+
+  for ((i = 0; i < $4; i++)); do
+    IFS= read -rd '' byte < <(dd bs=1 count=1 skip=$(($3 + i)) if="$2" 2>/dev/null)
+    byte=$(printf "%d" "'$byte")
+    _result=$((_result + 256 ** i * byte))
+  done
+
+  eval "$1=\$_result"
+}
+
+# Recursively extracts directories and files from a decrypted PFS image file.
+# $1: PFS image file name; must have an absolute path
+# $2: inode index
+# $3: current extraction path; used only for cosmetics
+extract_pfs_dir() {
+  local number_of_blocks
+  read_int_le number_of_blocks "$1" $((block_size + INODE_SIZE * $2 + 96)) 4
+  local direct_blocks
+  read_int_le direct_blocks "$1" $((block_size + INODE_SIZE * $2 + 100)) 4
+  local offset=$((block_size * direct_blocks))
+
+  if [[ $debug_pfs ]]; then
+    debug_message "Entering new directory (inode $2)"
+    debug_message "(Number of blocks: $number_of_blocks)"
+    debug_message "Direct blocks: $direct_blocks"
+    debug_message "Offset: $offset"
+  fi
+
+  # Warn if there are too many blocks
+  if [[ $number_of_blocks -gt $direct_blocks ]]; then
+    local indirect_blocks
+    read_int_le indirect_blocks "$1" $((block_size + INODE_SIZE * $2 + 104)) 4
+    warning_message "Inode $2 has more blocks than expected ($indirect_blocks indirect blocks)."
+  fi
+
+  local cur_block
+  for ((cur_block = 0; cur_block < number_of_blocks; cur_block++)); do
+    while true; do
+      local dirent_inode_index
+      read_int_le dirent_inode_index "$1" $offset 4
+      # Leave current block if no more directory entries
+      if [[ $dirent_inode_index == 0 ]]; then
+        [[ $debug_pfs ]] && debug_message \
+          "No more directory entries in block $cur_block"
+        break
+      fi
+
+      local dirent_type
+      read_int_le dirent_type "$1" $((offset + 4)) 4
+      local dirent_size
+      read_int_le dirent_size "$1" $((offset + 12)) 4
+      local dirent_filename
+      read_string dirent_filename "$1" $((offset + 16))
+
+      if [[ $debug_pfs ]]; then
+        debug_message "Reading inode $2, block $cur_block, directory entry $i"
+        debug_message "  -> Directory entry inode index: $dirent_inode_index"
+        debug_message "  -> Directory entry type: $dirent_type"
+        debug_message "  -> Directory entry size: $dirent_size"
+        local dirent_filename_len
+        read_int_le dirent_filename_len "$1" $((offset + 8)) 4
+        debug_message "  -> Directory entry file name length: $dirent_filename_len"
+        debug_message "  -> Directory entry file name: $dirent_filename"
+      fi
+
+      # Extract file or create directory
+      case $dirent_type in
+        2) # File
+          if [[ $2 -ne $superroot_inode_index ]]; then
+            if [[ $resume || ! -e "$dirent_filename" ]]; then
+              check_for_errors
+              # Wait if currently too many files are being extracted
+              if [[ $(jobs -r | wc -l) -ge 2 ]]; then
+                wait -n
+              fi
+              # Extract file in the background
+              {
+                echo "Extracting $3$dirent_filename"
+                local file_size
+                read_int_le file_size "$1" \
+                  $((inode_offsets[$dirent_inode_index] + 8)) 8
+                [[ $debug_pfs ]] && debug_message "File size: $file_size"
+                local file_block_number
+                read_int_le file_block_number "$1" \
+                  $((inode_offsets[$dirent_inode_index] + 100)) 4
+                local file_offset=$((block_size * file_block_number))
+                [[ $debug_pfs ]] && debug_message "File offset: $file_offset"
+                dd if="$1" $dd_options skip=$file_offset count=$file_size \
+                  2> /dev/null > "$dirent_filename" || abort \
+                  "Error while extracting file \"$dirent_filename\"."
+              } &
+            else
+              warning_message \
+                "File already exists: \"$3$dirent_filename\" (skipped)."
+            fi
+          fi
+          ;;
+        3) # Directory
+          if [[ $2 -eq $superroot_inode_index ]]; then
+            extract_pfs_dir "$1" $dirent_inode_index "" # Extract true root dir
+          else
+            echo "Extracting $3$dirent_filename/"
+            mkdir -p "$dirent_filename" || abort
+            cd "$dirent_filename" || abort
+            extract_pfs_dir "$1" $dirent_inode_index "$3$dirent_filename/" # Extract next directory
+            cd .. || abort
+            [[ $debug_pfs ]] && debug_message \
+              "Returning to previous directory (inode $2)"
+          fi
+          ;;
+      esac
+
+      offset=$((offset + dirent_size))
+    done
+  done
+}
+
+# Extracts all files from PFS image file $1.
+extract_pfs_image() {
+  [[ $debug ]] && debug_message "Extracting PFS image file \"$1\"."
+  read_int_le superroot_inode_index "$1" 72 8
+  read_int_le block_size "$1" 32 4
+
+  # Load inode offsets
+  local number_of_inodes
+  read_int_le number_of_inodes "$1" 48 8
+  local offset=block_size
+  local gap
+  local i
+  inode_offsets=()
+  for ((i = 0; i < $number_of_inodes; i++)) {
+    gap=$((block_size - offset % block_size))
+    if [[ $gap -lt $INODE_SIZE ]]; then
+      offset=$((offset + gap))
+    fi
+    inode_offsets[$i]=$offset
+    offset=$((offset + INODE_SIZE))
+  }
+
+  extract_pfs_dir "$(realpath "$1")" $superroot_inode_index ""
+  echo "Waiting for extraction to finish ..."
+  wait
+  check_for_errors
+}
+
+# Downloads and extracts PFS image file $1.
+dump_and_extract_pfs_image() {
+  echo "Downloading PFS image file ..."
+
+  curl $curl_options $curl_resume $curl_verbose --progress-bar --remote-name \
+    "$1" || curl_error "$1"
+  extract_pfs_image "pfs_image.dat"
+
+  rm "pfs_image.dat" || abort \
+    "Could not remove temporary file \"pfs_image.dat\"."
+}
+
+# Replaces the PFS image dump's encrypted files with decrypted versions.
+# $1: FTP path to compare current directory with
+replace_encrypted_files() {
+  echo "Replacing encrypted files ..."
+
+  find . -type f -print0 | while read -d $'\0' file_path; do
+    file_name=${file_path#./}
+    [[ $debug ]] && debug_message "Checking $file_name"
+    read_int_be magic_number "$file_name" 0
+    # File is encrypted
+    if [[ $magic_number == 1326791965 ]]; then
+      dir="${file_path%/*}"
+      cd "$dir" || abort
+      [[ $debug ]] && debug_message "Replacing encrypted file \"$file_name\"."
+      dump_file "$1$file_name"
+      cd - > /dev/null || abort
+    fi
+  done
+}
+
+# Main script: #################################################################
+
+export LC_ALL=C
+
+# Global variables
+declare download_size
+declare output_dir
+main_pid=$BASHPID
+
+# Get options
+build_args "$@"
+for ((i = 0; i < argc; i++)); do
+  if [[ $no_more_args ]]; then
+    non_options[noptc++]=${argv[i]}
+  else
+    case ${argv[i]} in
+      --) no_more_args=1 ;;
+      -a|-g|--app|--game|--app-only) option_app=1 ;;
+      --active)
+          curl_options+=' --ftp-port -'
+          wget_options+=' --no-passive-ftp'
+          ;;
+      --appdb) dump_appdb=1 ;;
+      --beep) force_beep=1 ;;
+      -d|--ac|--dlc|--dlc-only) option_dlc=1 ;;
+      --download|--dump)
+        if [[ $((++i)) -lt argc ]]; then
+          if [[ ${argv[i]^^} =~ ^[A-Z]{4}[0-9]{5}$ ]]; then
+            dump_title_id+=(${argv[i]^^})
+            while [[ $((i + 1)) -lt argc && \
+              ${argv[i + 1 ]^^} =~ ^[A-Z]{4}[0-9]{5}$ ]]; do
+              ((i++))
+              dump_title_id+=(${argv[i]^^})
+            done
+          else
+            dump_path=${argv[i]}
+          fi
+        else
+          echo "Missing argument for option --dump." >&2
+          exit 1
+        fi
+        ;;
+      --debug) debug=1 ;;
+      --debug-pfs) debug_pfs=1 ;;
+      --extract-pfs)
+        option_extract_pfs=1
+        if [[ $((++i)) -lt argc ]]; then
+          pfs_file=$(realpath "${argv[i]}")
+        else
+          echo "Missing argument for option --extract-pfs." >&2
+          print_usage >&2
+          exit 1
+        fi
+        ;;
+      --extract-pkg)
+        option_extract_pkg=1
+        if [[ $((++i)) -lt argc ]]; then
+          pkg_file=$(realpath "${argv[i]}")
+        else
+          echo "Missing argument for option --extract-pkg." >&2
+          print_usage >&2
+          exit 1
+        fi
+        ;;
+      --fix-remaster)
+        if [[ $((++i)) -lt argc ]]; then
+          param_sfo_file=${argv[i]}
+          if [[ ! -f "$param_sfo_file" ]]; then
+            echo "Option --fix-remaster: File does not exist: \"$param_sfo_file\"." >&2
+            exit 1
+          fi
+        else
+          echo "Missing argument for option --fix-remaster." >&2
+          print_usage >&2
+          exit 1
+        fi
+        option_fix_remaster=1
+        ;;
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      -k|--keystone) dump_keystone=1 ;;
+      --keep-trying)
+        curl_options+=" --retry 999999 --retry-delay 1 --retry-max-time 0"
+        wget_options+=" -t inf "
+        ;;
+      --list)
+        option_list=1
+        list_sort_order=1
+        ;;
+      --list[0-9])
+        option_list=1
+        list_sort_order=${argv[i]:6:1}
+        if [[ $list_sort_order != [1-6] ]]; then
+          echo "Option --list: N must be an integer between 1 and 6." >&2
+          print_usage >&2
+          exit 1
+        fi
+        ;;
+      --no-decrypt) option_no_decrypt=1 ;;
+      -o|--output-dir)
+        if [[ $((++i)) -lt argc ]]; then
+          output_dir=$(realpath "${argv[i]}")
+        else
+          echo "Missing argument for option --output-dir." >&2
+          exit 1
+        fi
+        ;;
+      -p|--patch|--patch-only) option_patch=1 ;;
+      -r|--resume)
+        resume=1
+        curl_resume="-C -"
+        wget_resume=-c
+        ;;
+      -s|--sflash|--sflash0) dump_sflash=1 ;;
+      --shutdown) shutdown=1 ;;
+      --use-pfs) pfs_extraction_enabled=1 ;;
+      -v|--verbose)
+        verbose=1
+        curl_verbose=-v
+        wget_verbose=-S
+        ;;
+      -*)
+        echo "Unknown option: ${argv[i]}" >&2
+        print_usage >&2
+        exit 1
+        ;;
+      *) non_options[noptc++]=${argv[i]} ;;
+    esac
+  fi
+done
+
+# If there are too many non-option arguments, list them and quit; always ignore
+# the first non-option as it could be permanently used in scripts as IP/hostname
+if [[ noptc -gt 1 ]]; then
+  printf "Too many non-option arguments:" >&2
+  for ((i = 1; i < noptc; i++)); do
+    printf " \"${non_options[i]}\"" >&2
+  done
+  echo >&2
+  exit 1
+fi
+
+# Check Bash version
+bash_version=$(bash --version)
+bash_version=${bash_version#*bash, version }
+full_bash_version=${bash_version%% (*}
+bash_version=${bash_version:0:1}
+if [[ $bash_version == [0-9] ]]; then
+  if [[ $bash_version -ge 5 ]]; then
+    [[ $debug ]] && debug_message "Bash version \"$full_bash_version\" detected."
+  else
+    warning_message "Your Bash version \"$full_bash_version\" is heavily outdated. The script might not run properly."
+  fi
+else
+  warning_message "Could not check Bash version. Please report this if you encounter any script errors."
+fi
+
+# Check for gdd and ggrep on macOS
+if [[ $(uname) == Darwin ]]; then
+  if gdd --version &> /dev/null; then
+    [[ $debug ]] && debug_message "gdd detected - using gdd instead of dd."
+    alias dd=gdd
+  fi
+  if ggrep --version &> /dev/null; then
+    [[ $debug ]] && debug_message "ggrep detected - using ggrep instead of grep."
+    alias grep=ggrep
+  elif [[ $(grep --version 2> /dev/null) != *'GNU grep'* ]]; then
+    warning_message "On macOS, GNU grep (ggrep) may be required to automatically replace encrypted trophies (\"\$ brew install grep\")."
+  fi
+  shopt -s expand_aliases
+fi
+
+# Check sfo path
+if [[ $sfo_path ]]; then
+  sfo_path_user_defined=1
+  sfo_path=$(realpath "$sfo_path")
+else
+  sfo_path="${BASH_SOURCE%/*}/" # ftpdump's directory
+fi
+if [[ -d "$sfo_path" ]]; then
+  sfo_path=${sfo_path%/}
+  if [[ -f "$sfo_path/sfo" ]]; then sfo_path+=/sfo
+  elif [[ -f "$sfo_path/sfo_32" ]]; then sfo_path+=/sfo_32
+  elif [[ -f "$sfo_path/sfo.exe" ]]; then sfo_path+=/sfo.exe
+  elif [[ -f "$sfo_path/sfo_32.exe" ]]; then sfo_path+=/sfo_32.exe
+  else
+    [[ $sfo_path_user_defined ]] && warning_message \
+      "Could not find sfo in directory \"$sfo_path/\". Please adjust the variable \"sfo_path\" or make sure it is empty. Not using sfo."
+    unset sfo_path
+  fi
+elif [[ ! -f "$sfo_path" ]]; then
+  [[ $sfo_path_user_defined ]] && warning_message \
+    "Variable \"sfo_path\" points to a file, but the file does not exist. Not using sfo."
+  unset sfo_path
+fi
+if [[ ! $sfo_path ]]; then
+  [[ $debug ]] && debug_message "Could not find optional program \"sfo\"."
+  if [[ $list_sort_order -ge 6 ]]; then
+    list_sort_order=1
+    [[ $debug ]] && debug_message "Set list sort order to 1 because of missing sfo."
+  fi
+else
+  [[ $sfo_path && $debug ]] && debug_message "Found optional program \"sfo\" in \"$sfo_path\"."
+fi
+
+# Stores other temp files; from here on out, only exit with function clean_exit
+temp_file_list=$(mktemp)
+[[ $? != 0 ]] && abort "Could not create a temporary file."
+trap sigint_exit SIGINT # To catch CTRL-C
+
+# If specified by user, run fix_remaster() and quit
+if [[ $option_fix_remaster ]]; then
+  if [[ ! $sfo_path ]]; then
+    echo "Option --fix-remaster: Cannot run without program \"sfo\" (https://github.com/hippie68/sfo)." >&2
+    clean_exit 1
+  fi
+  if ! fix_remaster "$param_sfo_file"; then
+    clean_exit 1
+  fi
+  clean_exit 0
+fi
+
+# Set dd options
+if dd --version 2> /dev/null | grep GNU > /dev/null; then
+  [[ $debug ]] && debug_message "GNU dd detected - using GNU-specific dd options."
+  dd_options="iflag=skip_bytes,count_bytes" # For GNU dd; much faster
+else
+  [[ $debug ]] && debug_message "Non-GNU dd detected - using regular dd options (slow!)."
+  dd_options="ibs=1"
+fi
+
+# Set output directory
+if [[ $output_dir ]]; then
+  [[ $debug ]] && debug_message "Using output directory \"$output_dir\"."
+else
+  output_dir=$(realpath .)
+  [[ $debug ]] && debug_message "Using current directory as output directory."
+fi
+
+# Temporary file used by the main process to spot failed jobs
+error_file=$(create_temp_file)
+
+# Extract PFS image file and quit (option --extract-pfs)
+if [[ $option_extract_pfs ]]; then
+  if [[ ! -f "$pfs_file" ]]; then
+    echo "File does not exist: \"$pfs_file\"." >&2
+    clean_exit 1
+  fi
+  mkdir -p "$output_dir" && cd "$output_dir" || abort
+  extract_pfs_image "$pfs_file"
+  clean_exit 0
+fi
+
+# Extract PKG file and quit (option --extract-pkg)
+if [[ $option_extract_pkg ]]; then
+  if [[ ! -f "$pkg_file" ]]; then
+    echo "File does not exist: \"$pkg_file\"." >&2
+    clean_exit 1
+  fi
+  mkdir -p "$output_dir" && cd "$output_dir" || abort
+  extract_pkg "$pkg_file"
+  clean_exit 0
+fi
+
+# Dump everything by default
+if [[ ! $option_app$option_patch$option_dlc$dump_keystone$dump_sflash$dump_appdb$dump_path ]]
+then
+  [[ $debug ]] && debug_message \
+    "No dump options specified - enabling app, patch, and DLC dumping."
+  option_app=1 option_patch=1 option_dlc=1
+fi
+
+# Display the current state of all options
+[[ $debug ]] && debug_message "Options: \
+option_app=$option_app, \
+option_patch=$option_patch, \
+option_dlc=$option_dlc, \
+dump_keystone=$dump_keystone, \
+dump_sflash=$dump_sflash, \
+dump_appdb=$dump_appdb, \
+dump_path=$dump_path, \
+dump_title_id=${dump_title_id[*]}, \
+option_no_decrypt=$option_no_decrypt, \
+debug=$debug, \
+debug_pfs=$debug_pfs, \
+curl_options=$curl_options, \
+curl_verbose=$curl_verbose, \
+wget_options=$wget_options, \
+wget_verbose=$wget_verbose, \
+pfs_extraction_enabled=$pfs_extraction_enabled, \
+sfo_path=$sfo_path"
+
+# Set FTP prefix
+if [[ ${non_options[0]} ]]; then
+  ip=${non_options[0]%:*}
+fi
+if [[ ${non_options[0]} == *:* ]]; then
+  port=${non_options[0]#*:}
+fi
+if [[ ! $port ]]; then
+  port=1337
+fi
+if [[ ! $ip ]]; then
+  echo "Please specify a hostname or an IP address." >&2
+  print_usage >&2
+  clean_exit 1
+fi
+root="ftp://$ip:$port"
+root=${root%/}
+[[ $debug ]] && debug_message "Using FTP server \"$root\"."
+
+# Check for cURL
+if ! curl --version &> /dev/null; then
+  echo "cURL not found, which is required to run the script. Please install cURL and try again." >&2
+  clean_exit 1
+fi
+
+# Check for Wget
+if ! wget --version &> /dev/null; then
+  echo "Wget not found, which is required to run the script. Please install GNU Wget and try again." >&2
+  if [[ $(cat /proc/version 2> /dev/null) == *Microsoft* ]]; then
+    echo "Try to install it by opening a Windows command prompt and entering \"wsl -e sudo apt install wget\"." >&2
+  fi
+  clean_exit 1
+fi
+
+# Exit if FTP server is not running or does not reply within 5 seconds
+[[ $debug ]] && debug_message "Checking FTP connection ..."
+reply=$(curl --verbose --max-time 5 --silent --head "$root/" 2>&1 > /dev/null)
+case $? in
+  0) ;;
+  6) abort "Could not resolve host \"$ip\". Please fix your computer's and/or router's DNS settings or enter an IP address." ;;
+  7) abort "Could not connect to FTP server. Is it running, and are IP address and port correct?" ;;
+  *) curl_error ;;
+esac
+
+# Check for GoldHEN FTP server
+if [[ $reply == *GoldHEN*v2* ]]; then
+  if [[ $reply == *v2.0* ]]; then
+    [[ $debug ]] && debug_message "GoldHEN 2.x FTP server v2.0 detected."
+    goldhen_2_old=1 # Only 1 connection at a time, no KILL commmand
+  else
+    [[ $debug ]] && debug_message "GoldHEN 2.x FTP server v2.1+ detected."
+  fi
+fi
+
+# Print PKG list and quit (option --list)
+if [[ $option_list ]]; then
+  list_pkgs "$list_sort_order"
+  clean_exit 0
+fi
+
+# Send SHUTDOWN command and quit (option --shutdown)
+if [[ $shutdown ]]; then
+  if curl --head --quote SHUTDOWN "$root" 2> /dev/null; then
+    echo "SHUTDOWN command successfully sent."
+    exit 0
+  else
+    warning_message "Server does not support the SHUTDOWN command."
+    clean_exit 1
+  fi
+fi
+
+# Check for KILL command support
+if [[ ! $goldhen_2_old && $reply != *hippie68* ]]; then
+  reply=$(curl --silent --verbose --head --quote KILL "$root" 2>&1)
+  if [[ $? -eq 0 ]]; then
+    if [[ $reply == *'< 200'* ]]; then
+      [[ $debug ]] && debug_message \
+        "Server supports the KILL command, which is great."
+      kill_switch=1;
+    elif [[ $reply != *'< 202'* ]]; then
+      warning_message \
+        "Server does not support the KILL command - subsequent dumps may become slower each time."
+    fi
+  fi
+fi
+unset reply
+
+# Create output directory
+mkdir -p "$output_dir" && cd "$output_dir" || abort
+
+# Dump database
+if [[ $dump_appdb ]]; then
+  dump_file "$root/system_data/priv/mms/app.db"
+  clean_exit 0
+fi
+
+# Dump sflash0
+if [[ $dump_sflash ]]; then
+  dump_file "$root/dev/sflash0"
+  clean_exit 0
+fi
+
+# Set decryption; mandatory at this point
+if [[ $option_no_decrypt ]]; then
+  set_decryption 0
+else
+  set_decryption 1
+fi
+
+# Dump user-provided PKG (Title ID), file, or directory
+if [[ $dump_title_id ]]; then
+  [[ $debug ]] && debug_message "Using Title ID \"$dump_title_id\" to dump PKGs."
+  dump_pkgs "${dump_title_id[@]}"
+  clean_exit 0
+elif [[ $dump_path ]]; then
+  if [[ ${dump_path:0:1} == '/' ]]; then
+    if [[ ${dump_path##*/} ]]; then
+      [[ $debug ]] && debug_message "Treating as file: \"$dump_path\"."
+      dump_file "$root$dump_path"
+    else
+      [[ $debug ]] && debug_message "Treating as directory: \"$dump_path\"."
+      dump_dir "$root$dump_path"
+    fi
+  else
+    abort "Option --dump: Neither a file/directory nor a Title ID: \"$dump_path\"."
+  fi
+  clean_exit 0
+fi
+
+# For other dumps, get the currently running app's Title ID
+title_id=$(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/" \
+  | grep -Eo -m1 '[A-Z]{4}[0-9]{5}-app0')
+title_id=${title_id%-app0}
+if [[ ! $title_id =~ ^[A-Z]{4}[0-9]{5}$ ]]; then
+  echo "Could not retrieve Title ID. Is the game started?" >&2
+  clean_exit 1
+fi
+
+# Dump keystone
+if [[ $dump_keystone ]]; then
+  dump_keystone "$title_id"
+fi
+
+# Dump app data
+if [[ $option_app ]]; then
+  dump_app_data "$title_id"
+fi
+
+# Dump patch data
+if [[ $option_patch ]]; then
+  dump_patch_data "$title_id"
+fi
+
+# Dump DLC data
+if [[ $option_dlc ]]; then
+  dump_dlc_data "$title_id"
+fi
+
+clean_exit 0
