@@ -120,4 +120,6 @@ if [ "$need_remount" -eq 1 ]; then
     fi
 fi
 
-exec "$shadps4" "$merged_mount"
+if [ "${1:-}" != "-d" ]; then
+    exec "$shadps4" "$merged_mount"
+fi
