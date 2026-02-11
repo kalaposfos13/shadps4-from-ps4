@@ -9,7 +9,7 @@ shadps4="" # the shadPS4 (CLI) executable
 ps4_mount="" # path to mount the PS4 FTP server to
 ftpminidump_root="" # path to dump game metadata to
 merged_mount="" # working directory for overlayfs
-ps4_ip="" # "ip:port" format
+rclone_mount="" # name of the rclone mount you set up for the PS4
 EOF
     echo "Please set your enviroment variables.";
     exit 1;
@@ -19,7 +19,7 @@ EOF
 : "${shadps4:?shadps4 not set}"
 : "${ps4_mount:?ps4_mount not set}"
 : "${merged_mount:?merged_mount not set}"
-: "${ps4_ip:?ps4_ip not set}"
+: "${rclone_mount:?rclone_mount not set}"
 
 unmount_if_needed() {
     mount | grep -q "on $1 " && echo "Unmounting $1" && umount "$1"
@@ -36,18 +36,19 @@ command -v fuse-overlayfs >/dev/null || {
     exit 1
 }
 
+command -v rclone >/dev/null 2>&1 || {
+    echo "rclone not found in PATH"
+    exit 1
+};
+
 [ -x "$shadps4" ] || { echo "shadPS4 not found"; exit 1; }
 [ -f "$ftpminidump" ] || { echo "ftpminidump not found"; exit 1; }
 [ -d "$ps4_mount/mnt/sandbox" ] || {
     echo "PS4 mount not found or not mounted, attempting to mount...";
-    command -v curlftpfs >/dev/null 2>&1 || {
-        echo "curlftpfs not found in PATH"
-        exit 1
-    };
     unmount_if_needed $merged_mount;
     unmount_if_needed $ps4_mount; # free stuck mounts after a PS4 crash
-    curlftpfs $ps4_ip $ps4_mount || {
-        echo "curlftpfs failed";
+    rclone mount --daemon $rclone_mount: $ps4_mount || {
+        echo "rclone mount failed";
         exit 1;
     }
 }
