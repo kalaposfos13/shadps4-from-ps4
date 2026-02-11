@@ -8,13 +8,15 @@ Using this tool, you dont need to dump the whole game to another disk, but asset
 ## Requirements
 1. A jailbroken PS4
 2. A linux system
+3. rclone
+4. fuse-overlayfs
 
 ## Guide
 1. Clone the repo.
 2. Jailbreak your PS4 and start an FTP server.
-3. Start one of your games.
-4. Until the upstream project is fixed, download the custom [curlftpfs release](https://github.com/kalaposfos13/shadps4-from-ps4/releases/tag/curlftpfs) (see description as to why).
-5. Create a mount point for your ps4: `sudo mkdir -p /mnt/ps4 && sudo chown $(whoami) /mnt/ps4`. The mountpoint can be whatever is more convenient to you.\
+3. Set up rclone with `rclone config`. Make sure to set any dummy password, for some reason it doesn't like an empty one.
+4. Start one of your games.
+5. Create a mount point for your ps4, for example: `mkdir ~/ps4_mnt`. The mountpoint can be whatever is more convenient to you.\
 6. Run `./run-current-game.sh`. On the first try you will get a message: `Please set your enviroment variables.`. Then run `nano .env` and fill in the details that are asked.
 
 ## Flags
