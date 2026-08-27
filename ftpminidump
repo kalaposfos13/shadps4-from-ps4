@@ -78,6 +78,7 @@ Options:
       --use-pfs        While dumping, instead of downloading files separately,
                        download and extract the PFS image file.
   -v, --verbose        Print the client/server dialog when downloading files.
+  -m, --minidump       Dump only sce_sys, and executables
 EOF
 }
 
@@ -143,7 +144,8 @@ beep_function() {
 # Requires the server to support the custom command KILL.
 kill_downloads() {
   if [[ $kill_switch ]]; then
-    curl $curl_options --head --quote KILL "$root" 2> /dev/null
+    # curl $curl_options --head --quote KILL "$root" 2> /dev/null
+    debug_message "skipping KILL"
   fi
 }
 
@@ -349,7 +351,7 @@ set_decryption() {
 
 # Checks if an FTP file or directory exists.
 ftp_file_exists() {
-  if curl --head --silent "$1" &> /dev/null; then
+  if curl --head --silent "$1" | grep "Content-Length"; then
     return 0
   else
     return 1
@@ -490,11 +492,17 @@ dump_dir() {
   [[ $debug ]] && debug_message \
     "Dumping directory \"$line\", cutting $dir_count directories."
 
+  # --accept-regex='(/$|(^|/)(eboot[^/]*|[^/]*\.(elf|prx|sprx))$)'
+  if [[ $minidump_enabled ]]; then 
+    wget_minidump=--accept-regex\='(/$|(^|/)(eboot[^/]*|[^/]*\.(elf|prx|sprx))$)'
+  fi
+
   # Download directory recursively
-  wget --cut-dirs $dir_count --no-host-directories --no-parent \
-    --no-verbose --recursive $wget_options $wget_resume $wget_verbose \
-    --accept-regex='(/$|(^|/)(eboot[^/]*|[^/]*\.(elf|prx|sprx))$)' \
-    --level inf "$1" 2>&1 | \
+  wget --cut-dirs $dir_count \
+        --no-host-directories --no-parent \
+        --no-verbose --recursive \
+        $wget_options $wget_resume $wget_verbose $wget_minidump \
+        --level inf "$1" 2>&1 | \
     while read -r line; do
       if [[ $line == *" ->"* ]]; then
         file_name=${line%\"*}
@@ -1126,7 +1134,7 @@ extract_pkg() {
 dump_and_extract_pkg() {
   local pkg_filename=${1##*/}
 
-  echo "Preparing extraction of $pkg_filename ..."
+  echo "Preparing extraction of $1 ..."
 
   # Test how much PKG data should be downloaded
   [[ $debug ]] && debug_message \
@@ -1461,6 +1469,7 @@ for ((i = 0; i < argc; i++)); do
       -s|--sflash|--sflash0) dump_sflash=1 ;;
       --shutdown) shutdown=1 ;;
       --use-pfs) pfs_extraction_enabled=1 ;;
+      -m|--minidump) minidump_enabled=1 ;;
       -v|--verbose)
         verbose=1
         curl_verbose=-v
@@ -1635,6 +1644,7 @@ curl_verbose=$curl_verbose, \
 wget_options=$wget_options, \
 wget_verbose=$wget_verbose, \
 pfs_extraction_enabled=$pfs_extraction_enabled, \
+minidump_enabled=$minidump_enabled, \
 sfo_path=$sfo_path"
 
 # Set FTP prefix
@@ -1709,19 +1719,19 @@ if [[ $shutdown ]]; then
 fi
 
 # Check for KILL command support
-if [[ ! $goldhen_2_old && $reply != *hippie68* ]]; then
-  reply=$(curl --silent --verbose --head --quote KILL "$root" 2>&1)
-  if [[ $? -eq 0 ]]; then
-    if [[ $reply == *'< 200'* ]]; then
-      [[ $debug ]] && debug_message \
-        "Server supports the KILL command, which is great."
-      kill_switch=1;
-    elif [[ $reply != *'< 202'* ]]; then
-      warning_message \
-        "Server does not support the KILL command - subsequent dumps may become slower each time."
-    fi
-  fi
-fi
+# if [[ ! $goldhen_2_old && $reply != *hippie68* ]]; then
+#   reply=$(curl --silent --verbose --head --quote KILL "$root" 2>&1)
+#   if [[ $? -eq 0 ]]; then
+#     if [[ $reply == *'< 200'* ]]; then
+#       [[ $debug ]] && debug_message \
+#         "Server supports the KILL command, which is great."
+#       kill_switch=1;
+#     elif [[ $reply != *'< 202'* ]]; then
+#       warning_message \
+#         "Server does not support the KILL command - subsequent dumps may become slower each time."
+#     fi
+#   fi
+# fi
 unset reply
 
 # Create output directory
@@ -1771,7 +1781,7 @@ title_id=$(curl $curl_options --silent "$root/mnt/sandbox/pfsmnt/" \
   | grep -Eo -m1 '[A-Z]{4}[0-9]{5}-app0')
 title_id=${title_id%-app0}
 if [[ ! $title_id =~ ^[A-Z]{4}[0-9]{5}$ ]]; then
-  echo "Could not retrieve Title ID. Is the game started?" >&2
+  echo "Could not retrieve Title ID (result: $title_id). Is the game started?" >&2
   clean_exit 1
 fi
 
